@@ -10,11 +10,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip11"
 	"github.com/nbd-wtf/go-nostr/nip42"
 	"golang.org/x/exp/slices"
+	"golang.org/x/time/rate"
 )
 
 // TODO: consider moving these to Server as config params
@@ -53,6 +54,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	defer s.clientsMu.Unlock()
 	s.clients[conn] = struct{}{}
 	ticker := time.NewTicker(pingPeriod)
+	stop := make(chan struct{})
 
 	// NIP-42 challenge
 	challenge := make([]byte, 8)
@@ -63,10 +65,19 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		challenge: hex.EncodeToString(challenge),
 	}
 
+	if s.options.perConnectionLimiter != nil {
+		ws.limiter = rate.NewLimiter(
+			s.options.perConnectionLimiter.Limit(),
+			s.options.perConnectionLimiter.Burst(),
+		)
+	}
+
 	// reader
 	go func() {
 		defer func() {
 			ticker.Stop()
+			stop <- struct{}{}
+			close(stop)
 			s.clientsMu.Lock()
 			if _, ok := s.clients[conn]; ok {
 				conn.Close()
@@ -85,7 +96,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 		// NIP-42 auth challenge
 		if _, ok := s.relay.(Auther); ok {
-			ws.WriteJSON([]interface{}{"AUTH", ws.challenge})
+			ws.WriteJSON(nostr.AuthEnvelope{Challenge: &ws.challenge})
 		}
 
 		for {
@@ -102,17 +113,27 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
+			if ws.limiter != nil {
+				// NOTE: Wait will throttle the requests.
+				// To reject requests exceeding the limit, use if !ws.limiter.Allow()
+				if err := ws.limiter.Wait(context.TODO()); err != nil {
+					s.Log.Warningf("unexpected limiter error %v", err)
+					continue
+				}
+			}
+
 			if typ == websocket.PingMessage {
 				ws.WriteMessage(websocket.PongMessage, nil)
 				continue
 			}
 
 			go func(message []byte) {
-				ctx = context.Background()
+				ctx = context.TODO()
+
 				var notice string
 				defer func() {
 					if notice != "" {
-						ws.WriteJSON([]interface{}{"NOTICE", notice})
+						ws.WriteJSON(nostr.NoticeEnvelope(notice))
 					}
 				}()
 
@@ -148,10 +169,12 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 					// check signature (requires the ID to be set)
 					if ok, err := evt.CheckSignature(); err != nil {
-						ws.WriteJSON([]interface{}{"OK", evt.ID, false, "error: failed to verify signature"})
+						reason := "error: failed to verify signature"
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: &reason})
 						return
 					} else if !ok {
-						ws.WriteJSON([]interface{}{"OK", evt.ID, false, "invalid: signature is invalid"})
+						reason := "invalid: signature is invalid"
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: &reason})
 						return
 					}
 
@@ -164,7 +187,8 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 								}
 
 								if err := store.DeleteEvent(ctx, tag[1], evt.PubKey); err != nil {
-									ws.WriteJSON([]interface{}{"OK", evt.ID, false, fmt.Sprintf("error: %s", err.Error())})
+									reason := fmt.Sprintf("error: %s", err.Error())
+									ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: &reason})
 									return
 								}
 
@@ -176,9 +200,12 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 
-					ok, message := AddEvent(ctx, s.relay, evt)
-					ws.WriteJSON([]interface{}{"OK", evt.ID, ok, message})
-
+					ok, message := AddEvent(ctx, s.relay, &evt)
+					var reason *string
+					if message != "" {
+						reason = &message
+					}
+					ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: ok, Reason: reason})
 				case "COUNT":
 					counter, ok := store.(EventCounter)
 					if !ok {
@@ -294,8 +321,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 						}
 						i := 0
 						for event := range events {
-							ws.WriteJSON([]interface{}{"EVENT", id, event})
-
+							ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 							i++
 							if i > filter.Limit {
 								break
@@ -307,7 +333,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
-					ws.WriteJSON([]interface{}{"EOSE", id})
+					ws.WriteJSON(nostr.EOSEEnvelope(id))
 					setListener(id, ws, filters)
 				case "CLOSE":
 					var id string
@@ -327,9 +353,11 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 						}
 						if pubkey, ok := nip42.ValidateAuthEvent(&evt, ws.challenge, auther.ServiceURL()); ok {
 							ws.authed = pubkey
-							ws.WriteJSON([]interface{}{"OK", evt.ID, true, "authentication success"})
+							ctx = context.WithValue(ctx, AUTH_CONTEXT_KEY, pubkey)
+							ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
 						} else {
-							ws.WriteJSON([]interface{}{"OK", evt.ID, false, "error: failed to authenticate"})
+							reason := "error: failed to authenticate"
+							ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: &reason})
 						}
 					}
 				default:
@@ -353,11 +381,14 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
 			case <-ticker.C:
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
 				err := ws.WriteMessage(websocket.PingMessage, nil)
 				if err != nil {
 					s.Log.Errorf("error writing ping: %v; closing websocket", err)
 					return
 				}
+			case <-stop:
+				return
 			}
 		}
 	}()

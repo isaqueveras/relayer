@@ -3,7 +3,8 @@ package relayer
 import (
 	"sync"
 
-	"github.com/gorilla/websocket"
+	"github.com/fasthttp/websocket"
+	"golang.org/x/time/rate"
 )
 
 type WebSocket struct {
@@ -13,6 +14,7 @@ type WebSocket struct {
 	// nip42
 	challenge string
 	authed    string
+	limiter   *rate.Limiter
 }
 
 func (ws *WebSocket) WriteJSON(any interface{}) error {

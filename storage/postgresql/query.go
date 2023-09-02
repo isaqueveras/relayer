@@ -17,11 +17,13 @@ func (b PostgresBackend) QueryEvents(ctx context.Context, filter *nostr.Filter) 
 
 	query, params, err := b.queryEventsSql(filter, false)
 	if err != nil {
+		close(ch)
 		return nil, err
 	}
 
 	rows, err := b.DB.Query(query, params...)
 	if err != nil && err != sql.ErrNoRows {
+		close(ch)
 		return nil, fmt.Errorf("failed to fetch events using query %q: %w", query, err)
 	}
 
@@ -66,7 +68,7 @@ func (b PostgresBackend) queryEventsSql(filter *nostr.Filter, doCount bool) (str
 	}
 
 	if filter.IDs != nil {
-		if len(filter.IDs) > 500 {
+		if len(filter.IDs) > b.QueryIDsLimit {
 			// too many ids, fail everything
 			return "", nil, nil
 		}
@@ -89,7 +91,7 @@ func (b PostgresBackend) queryEventsSql(filter *nostr.Filter, doCount bool) (str
 	}
 
 	if filter.Authors != nil {
-		if len(filter.Authors) > 500 {
+		if len(filter.Authors) > b.QueryAuthorsLimit {
 			// too many authors, fail everything
 			return "", nil, nil
 		}
@@ -112,7 +114,7 @@ func (b PostgresBackend) queryEventsSql(filter *nostr.Filter, doCount bool) (str
 	}
 
 	if filter.Kinds != nil {
-		if len(filter.Kinds) > 10 {
+		if len(filter.Kinds) > b.QueryKindsLimit {
 			// too many kinds, fail everything
 			return "", nil, nil
 		}
@@ -139,7 +141,7 @@ func (b PostgresBackend) queryEventsSql(filter *nostr.Filter, doCount bool) (str
 		// add these tags to the query
 		tagQuery = append(tagQuery, values...)
 
-		if len(tagQuery) > 10 {
+		if len(tagQuery) > b.QueryTagsLimit {
 			// too many tags, fail everything
 			return "", nil, nil
 		}
@@ -159,11 +161,11 @@ func (b PostgresBackend) queryEventsSql(filter *nostr.Filter, doCount bool) (str
 	}
 
 	if filter.Since != nil {
-		conditions = append(conditions, "created_at > ?")
+		conditions = append(conditions, "created_at >= ?")
 		params = append(params, filter.Since)
 	}
 	if filter.Until != nil {
-		conditions = append(conditions, "created_at < ?")
+		conditions = append(conditions, "created_at <= ?")
 		params = append(params, filter.Until)
 	}
 
